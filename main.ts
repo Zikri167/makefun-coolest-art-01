@@ -1,31 +1,54 @@
+import { createHash } from "node:crypto";
 import { copyFile, mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const here = dirname(fileURLToPath(import.meta.url));
-// Default to the competition mount unless a local output folder is supplied.
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
-// Resolve the source beside this script so it works from any working directory.
-const source = join(here, "entry.png");
-// Validate the generated asset before copying it into the competition output.
-const png = await readFile(source);
-// Reject an empty source before attempting to inspect its PNG header.
-if (png.length === 0) {
-  throw new Error(`Expected entry.png to be non-empty; observed 0 bytes at ${source}`);
+const source = join(dirname(fileURLToPath(import.meta.url)), "entry.png");
+const destinationDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
+const destination = join(destinationDir, "entry.png");
+const image = await readFile(source);
+
+function reject(reason: string): never {
+  throw new Error(`Invalid image: ${reason}`);
 }
-const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-if (!png.subarray(0, 8).equals(signature)) {
-  throw new Error(`Expected a PNG signature in entry.png at ${source}; observed an invalid signature`);
+
+if (image.length === 0) reject("the file is empty");
+if (image.length > 1_048_576) reject("the file exceeds 1 MiB");
+if (image[0] !== 0xff || image[1] !== 0xd8 || image[2] !== 0xff) {
+  reject("the file does not begin with a JPEG signature");
 }
-if (png.readUInt32BE(16) !== 1024 || png.readUInt32BE(20) !== 1024) {
-  const width = png.readUInt32BE(16);
-  const height = png.readUInt32BE(20);
-  throw new Error(`Expected entry.png dimensions 1024×1024 pixels; observed ${width}×${height}`);
+
+let width = 0;
+let height = 0;
+let position = 2;
+while (position < image.length) {
+  if (image[position] !== 0xff) reject("a JPEG marker is missing");
+  while (image[position] === 0xff) position++;
+  const marker = image[position++];
+  if (marker === undefined || marker === 0x00) reject("a JPEG marker is malformed");
+  if (marker === 0xd9 || marker === 0xda) break;
+  if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) continue;
+  if (position + 2 > image.length) reject("a JPEG segment is truncated");
+  const segmentLength = image.readUInt16BE(position);
+  if (segmentLength < 2 || position + segmentLength > image.length) {
+    reject("a JPEG segment has an invalid length");
+  }
+  if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+    if (segmentLength < 7) reject("the JPEG frame header is truncated");
+    height = image.readUInt16BE(position + 3);
+    width = image.readUInt16BE(position + 5);
+    break;
+  }
+  position += segmentLength;
 }
-if (png.length > 1048576) {
-  throw new Error(`Expected entry.png size at most 1048576 bytes; observed ${png.length} bytes`);
+
+if (width === 0 || height === 0) reject("no supported JPEG frame was found");
+if (width > 1024 || height > 1024) reject("image dimensions exceed 1024 pixels");
+if (image[image.length - 2] !== 0xff || image[image.length - 1] !== 0xd9) {
+  reject("the JPEG end marker is missing");
 }
-// Keep all checks ahead of directory creation so invalid art fails cleanly.
-await mkdir(outputDir, { recursive: true });
-// Copy from the same resolved path that was read and validated above.
-await copyFile(source, join(outputDir, "entry.png"));
+
+await mkdir(destinationDir, { recursive: true });
+await copyFile(source, destination);
+const digest = createHash("sha256").update(image).digest("hex");
+console.log(`Wrote ${destination} (${image.length} bytes, ${width}x${height}, sha256 ${digest})`);
